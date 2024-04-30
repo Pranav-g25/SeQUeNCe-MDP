@@ -18,6 +18,7 @@ from sequence.message import Message
 
 
 class policy():
+    '''Retreives policy data from  a json file for implementation.'''
     def __init__(self, policy_data) -> None:
         self.states = []
         self.action_spaces = []
@@ -32,6 +33,17 @@ class policy():
         jsonFile =  open(file_name, encoding="utf-8-sig") 
         policy_data = json.load(jsonFile)
         return policy_data
+
+class NodesTracker():
+    ''' Creates, manages all nodes, bsmnodes, links etc.'''
+    def __init__( self, _tl, _numRouters, _numGenerations, _light_speed, _endnode_distance ):
+
+class SimpleManager():
+    '''Resource manager for 'EntangleGenNode' objects '''
+
+class EntangleGenNode(Node):
+    '''overwriting functions like receive_message etc. to incorporate features of c_node control operations and policy.'''
+        
 
 
 
