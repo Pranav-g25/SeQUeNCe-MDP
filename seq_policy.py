@@ -110,14 +110,14 @@ class SimpleManager():
         if protocol.name[ -3: ] == '_eg':
             self.update_eg( protocol, memory, state )
         elif protocol.name[ -3: ] == 'ESA':
-            self.update_es( protocol, memory, state )
+            self.update_es_new( protocol, memory, state )
         else:
             if len( protocol.name ) < 4:
                 raise ValueError( 'I don\'t know this protocol name: %s' % protocol.name )
             if protocol.name[-4] == 'G':
                 self.update_eg( protocol, memory, state )
             elif protocol.name[-4] == 'S':
-                self.update_es( protocol, memory, state )
+                self.update_es_new( protocol, memory, state )
             else:
                 raise ValueError( 'Wrong protocol name: %s' % protocol.name )
 
@@ -316,6 +316,22 @@ class SimpleManager():
         #        self.nodesTracker.tl.schedule( Event( self.nodesTracker.tl.now() + _time_to_wait, 
         #                                             self.nodesTracker.process ) )
             
+    def update_es_new(self, protocol, memory, state):
+        _memo_id = None
+        if memory.name == self.leftMemoName:
+            _memo_id = 0
+            #self.updated[0] = True
+        elif memory.name == self.rightMemoName:
+            _memo_id = 1
+            #self.updated[1] = True
+        
+        if state == 'RAW':
+            memory.reset()
+
+        if state == 'ENTANGLED':
+            self.nodeNo
+        
+
     def update_es( self, protocol, memory, state ):
         _memo_id = None
         if memory.name == self.leftMemoName:
@@ -324,7 +340,7 @@ class SimpleManager():
         elif memory.name == self.rightMemoName:
             _memo_id = 1
             #self.updated[1] = True
-            
+        
         if state == 'RAW':
             memory.reset()
         #else:
@@ -484,20 +500,21 @@ class EntangleGenNode(Node):
                         _cnodeData.current_state[self.resource_manager.nodeNo, self.resource_manager.nodeNo - 1] \
                               = _cnodeData.current_state[self.resource_manager.nodeNo - 1, self.resource_manager.nodeNo] = 0
                     
+                    else:
+                        _nodesTracker.linksForNextSession.append( Link( ( self.resource_manager.nodeNo - 1, self.resource_manager.nodeNo ) ) )
+                    
                     if _cnodeData.genLinksUpdated == _cnodeData.numLinksToBeUpdatedAtThisSession:
+                        _nodesTracker.links.clear()
+                        _nodesTracker.links = _nodesTracker.linksForNextSession
+
                         _action = _cnodeData.findActionForCurrentStateAccToPolicy(_cnodeData.current_state)
-                        if len(_action):
-                            pass
-                        else:
-                            for i in range(len(_action)):
-                                _process = Process( _nodesTracker, 'doSwap', _action[i] )
-                                _nodesTracker.updateProcessToSchedule( _process )
-                                _nodesTracker.numLinksToBeUpdatedAtThisSession = None
-                                _cnodeData.numLinksToBeUpdatedAtThisSession = None 
-                                _time_to_wait = ( _nodesTracker.signalingDelay + 1 #0.5*_nodesTracker.endnode_distance/_nodesTracker.light_speed
+
+                        _process = Process( _nodesTracker, 'doAction',[ _action] )
+                        _nodesTracker.updateProcessToSchedule( _process )
+                        _time_to_wait = ( _nodesTracker.signalingDelay + 1 #0.5*_nodesTracker.endnode_distance/_nodesTracker.light_speed
                                               if _nodesTracker.numRouters > 0
                                               else 1 )
-                                _nodesTracker.tl.schedule( Event( _nodesTracker.tl.now() + _time_to_wait,
+                        _nodesTracker.tl.schedule( Event( _nodesTracker.tl.now() + _time_to_wait,
                                                               _process ) )
                     '''            
                     else:
@@ -511,12 +528,14 @@ class EntangleGenNode(Node):
                         _nodesTracker.flushTotallyAllPendingEvents()
                         _nodesTracker.result = False
                             #print( 'dbg: cnode received gen failed:',  _nodesTracker.tl.now() * _nodesTracker.light_speed / _nodesTracker.endnode_distance )'''
-            elif msg.msg_type is ControlNodeMsgType.ESTABLISHED_LINK_WAS_BROKEN:
+                '''
+                elif msg.msg_type is ControlNodeMsgType.ESTABLISHED_LINK_WAS_BROKEN:
                 _nodesTracker = self.resource_manager.nodesTracker
                 _nodesTracker.resetAllMemories()
                 _nodesTracker.flushTotallyAllPendingEvents()
                 _nodesTracker.resetNodesUpdatesFlags()
                 _nodesTracker.result = False
+                '''
             else:
                 raise ValueError( 'I don\'t expext this msg_type: %s' % msg_type )
         else:
@@ -643,6 +662,7 @@ class NodesTracker():
         self.swapping_params = None
         #self.memosToTrack = []
         self.links = []
+        self.linksForNextSession= []
         self.establishedLinks = []
         #self.numLinksToBeUpdatedAtThisSession = None
         self.numTrials = 0
@@ -654,7 +674,7 @@ class NodesTracker():
         self.swpAccDelayDelta = 0
         self.signalingDelay = ( max( self.cnodeNo, _numRouters + 1 - self.cnodeNo )
                                 * _endnode_distance / _light_speed / ( _numRouters + 1 ) ) 
-
+        self.t_cut = None
     def reset( self ):
         #self.memosToTrack.clear()
         #self.entangledMemories.clear()
@@ -769,7 +789,7 @@ class NodesTracker():
                 s.tl.remove_event( e )
 
     def doGenerationPart( s ):            
-        if s.numTrials > 1e6:
+        '''if s.numTrials > 1e6:
             s.result = False
             s.resetAllMemories()
             s.flushTotallyAllPendingEvents()
@@ -783,7 +803,7 @@ class NodesTracker():
             return
             
         s.numTrials += 1
-
+        '''
         if doDubugOutput:
             print( '################ generation ###################' )
             print( 'time:', s.tl.now() )
@@ -794,13 +814,13 @@ class NodesTracker():
 
 
         #print( s.links )
-
+        '''
         if len( s.links ) == 0:
             #_process = Process( s, 'doSwappingPart', [] )
             #s.updateProcessToSchedule( _process )
             #s.tl.schedule( Event( s.tl.now() + 10, _process ) )
             return
-
+        '''
         #_memosToTrack = []
         for _link in s.links:
             _j1, _j2 = _link.node_left, _link.node_right
@@ -822,9 +842,10 @@ class NodesTracker():
         #s.updateTrackingList( _memosToTrack )
         #s.numLinksToBeUpdatedAtThisSession = len( s.links )
         #s.numGeneratedLinksReported = 0
+        '''
         s.nodes[ 2*s.cnodeNo ].cnodeData.numLinksToBeUpdatedAtThisSession = len( s.links )
         s.nodes[ 2*s.cnodeNo ].cnodeData.genLinksUpdated = 0
-
+        '''
         s.tl.init()
 
         for _link in s.links:
@@ -965,52 +986,63 @@ class NodesTracker():
             continue
 
 
-    def doSwap(s, nodeNo: int):
+    def doAction(s, __action):
+        if len(__action) == 0:
+            pass
 
-        rightNodeName = s.nodes[2*nodeNo].right_memo.entangled_memory['node_id']
-        if rightNodeName is None:
-            print('wtf1')
-            return False
-        
-        rightNodeNo = rightNodeName[4:]
-
-        leftNodeName = s.nodes[2*nodeNo].left_memo.entangled_memory['node_id']
-        if leftNodeName is None:
-            print('wtf1')
-            return False
-        
-        leftNodeNo = rightNodeName[4:]
-
-        midNodeNo = nodeNo
-        s.nodes[2*leftNodeNo].protocols[ 3 ] = None
-        s.nodes[2*rightNodeNo].protocols[ 2 ] = None
-        s.nodes[2*midNodeNo].protocols[ 2:4 ] = [ None, None ]
-        s.nodes[2*leftNodeNo].create_es_protocol_ends( 1 )
-        s.nodes[2*rightNodeNo].create_es_protocol_ends( 0 )
-        s.nodes[2*midNodeNo].create_es_protocol_middle( s.swapping_params )
-
-        pair_es_protocol(s.nodes[2*leftNodeNo].protocols[3], s.nodes[2*midNodeNo].protocols[2])
-        pair_es_protocol(s.nodes[2*rightNodeNo].protocols[2], s.nodes[2*midNodeNo].protocols[2])
-
-        __elemLinkLengthDelay = s.endnode_distance / ( s.numRouters + 1 ) / s.light_speed
-
-        if leftNodeNo <= s.cnodeNo and rightNodeNo >= s.cnodeNo:
-                pass
-        elif abs( s.cnodeNo - leftNodeNo ) < abs( s.cnodeNo - rightNodeNo ):
-            __extraDelayNeeded = abs( s.cnodeNo - leftNodeNo ) * __elemLinkLengthDelay
-            if __extraDelayNeeded > s.swpAccDelayDelta:
-                s.swpAccDelayDelta = __extraDelayNeeded
-        elif abs( s.cnodeNo - rightNodeNo ) < abs( s.cnodeNo - leftNodeNo ):
-            __extraDelayNeeded = abs( s.cnodeNo - rightNodeNo ) * __elemLinkLengthDelay
-            if __extraDelayNeeded > s.swpAccDelayDelta:
-                s.swpAccDelayDelta = __extraDelayNeeded
         else:
-            raise ValueError( 'leftNode=%d, midNode=%d, rightNode=%d, cnodeNo=%d' % (
-                leftNodeNo, midNodeNo, rightNodeNo, s.cnodeNo ) )  
+            for i in __action:
+                rightNodeName = s.nodes[2*i].right_memo.entangled_memory['node_id']
+                rightNodeNo = rightNodeName[4:]
+                leftNodeName = s.nodes[2*i].left_memo.entangled_memory['node_id']
+                leftNodeNo = leftNodeName[4:]
+                midNodeNo = i
 
-        s.nodes[2*leftNodeNo].protocols[3].start()
-        s.nodes[2*rightNodeNo].protocols[2].start()
-        s.nodes[2*midNodeNo].protocols[2].start()                  
+                s.nodes[2*leftNodeNo].protocols[ 3 ] = None
+                s.nodes[2*rightNodeNo].protocols[ 2 ] = None
+                s.nodes[2*midNodeNo].protocols[ 2:4 ] = [ None, None ]
+                s.nodes[2*leftNodeNo].create_es_protocol_ends( 1 )
+                s.nodes[2*rightNodeNo].create_es_protocol_ends( 0 )
+                s.nodes[2*midNodeNo].create_es_protocol_middle( s.swapping_params )
+
+                pair_es_protocol(s.nodes[2*leftNodeNo].protocols[3], s.nodes[2*midNodeNo].protocols[2])
+                pair_es_protocol(s.nodes[2*rightNodeNo].protocols[2], s.nodes[2*midNodeNo].protocols[2])
+                __elemLinkLengthDelay = s.endnode_distance / ( s.numRouters + 1 ) / s.light_speed
+
+                if leftNodeNo <= s.cnodeNo and rightNodeNo >= s.cnodeNo:
+                        pass
+                elif abs( s.cnodeNo - leftNodeNo ) < abs( s.cnodeNo - rightNodeNo ):
+                    __extraDelayNeeded = abs( s.cnodeNo - leftNodeNo ) * __elemLinkLengthDelay
+                    if __extraDelayNeeded > s.swpAccDelayDelta:
+                        s.swpAccDelayDelta = __extraDelayNeeded
+                elif abs( s.cnodeNo - rightNodeNo ) < abs( s.cnodeNo - leftNodeNo ):
+                    __extraDelayNeeded = abs( s.cnodeNo - rightNodeNo ) * __elemLinkLengthDelay
+                    if __extraDelayNeeded > s.swpAccDelayDelta:
+                        s.swpAccDelayDelta = __extraDelayNeeded
+                else:
+                    raise ValueError( 'leftNode=%d, midNode=%d, rightNode=%d, cnodeNo=%d' % (
+                        leftNodeNo, midNodeNo, rightNodeNo, s.cnodeNo ) )  
+                
+                if rightNodeName is not None and leftNodeName is not None:
+                    
+                    s.nodes[2*leftNodeNo].protocols[3].start()
+                    s.nodes[2*rightNodeNo].protocols[2].start()
+                    s.nodes[2*midNodeNo].protocols[2].start()           
+
+                else:
+                    s.nodes[2*leftNodeNo].protocols[3].update_resource_manager(s.nodes[2*leftNodeNo].right_memo, 'RAW')
+                    s.nodes[2*rightNodeNo].protocols[2].update_resource_manager(s.nodes[2*rightNodeNo].left_memo, 'RAW')
+                    s.nodes[2*midNodeNo].protocols[2].update_resource_manager(s.nodes[2*midNodeNo].left_memo, 'RAW') 
+                    s.nodes[2*midNodeNo].protocols[2].update_resource_manager(s.nodes[2*midNodeNo].right_memo, 'RAW')
+            
+            for i in range(len(s.cnode.cnodeData.current_state[:,0])):
+                for j in range(len(s.cnode.cnodeData.current_state[:,0])):
+                    if s.cnode.cnodeData.current_state[i,j] is not -1:
+                        s.cnode.cnodeData.current_state[i,j] += 1
+                    if s.cnode.cnodeData.current_state[i,j] >= s.t_cut:
+                        s.cnode.cnodeData.current_state[i,j] = -1
+                        s.links.append(Link(()))
+
 
 
 
@@ -1021,6 +1053,7 @@ def runSimulations( _numRouters, _distance, _light_speed, _memory_params, _detec
     tl.init()
 
     nodesTracker = NodesTracker( tl, _numRouters, _repetitions, _light_speed, _distance )
+    nodesTracker.t_cut = 2
     _fiberPieceLength = _distance / ( 2 * ( _numRouters + 1 ) )
     nodes = [ EntangleGenNode( 'node0', tl, nodesTracker, **_memory_params ) ]
     for i in range( 1, _numRouters + 2 ):
@@ -1053,8 +1086,8 @@ def runSimulations( _numRouters, _distance, _light_speed, _memory_params, _detec
 
     numSuccessCases = 0
     links = []
-
-    while nodesTracker.genCounter <= _repetitions:
+    delivery_times = []
+    for i in range(_repetitions):
         nodesTracker.reset()
         nodesTracker.cnode.cnodeData.genLinksEstablished = 0
         assert len( links ) == 0
@@ -1064,6 +1097,8 @@ def runSimulations( _numRouters, _distance, _light_speed, _memory_params, _detec
             links.append( Link( ( j-1, j ) ) )
         
         nodesTracker.updateLinksToEstablish( links )
+        nodesTracker.cnode.cnodeData.numLinksToBeUpdatedAtThisSession = len( links )
+        nodesTracker.cnode.cnodeData.genLinksUpdated = 0
         process = Process( nodesTracker, 'doGenerationPart', [] )
         nodesTracker.updateProcessToSchedule( process )
         _time_to_wait = nodesTracker.signalingDelay + 1
@@ -1073,18 +1108,11 @@ def runSimulations( _numRouters, _distance, _light_speed, _memory_params, _detec
         _time_end_virt = tl.now()
 
         if nodesTracker.result:
-            numSuccessCases += 1
+            delivery_times.append(_time_end_virt)
         
         if tl.now() > 1160e12:
             break
     
-    return numSuccessCases / tl.now() * 1e12
+    return delivery_times
 
                                 
-
-
-
-
-
-
-
