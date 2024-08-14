@@ -5,7 +5,7 @@ from sequence.topology.node import QuantumRouter
 from sequence.topology.router_net_topo import RouterNetTopo
 from sequence.topology.node import QuantumRouter
 #from src.utils.swaping_rules.ResourceReservationProtocol import create_rules
-from utils.swaping_rules.ResourceReservationProtocol import create_rules
+from utils.swaping_rules.ResourceReservationProtocol import create_rulesASAP, create_rules
 import numpy as np
 import logging
 
@@ -17,9 +17,9 @@ from sequence.app.request_app import RequestApp
 import json
 import configparser
 import os
-N = 100
-def create_quantum_network(n_routers, output_file, config):
-    num_routers = n_routers
+N = 1
+def create_quantum_network(C, output_file, config):
+    num_routers = len(C)-1
     # Get memory parameters
     ATTENUATION = float(config.get('qchannel', 'attenuation'))
     DISTANCE = float(config.get('qchannel', 'distance'))
@@ -36,7 +36,7 @@ def create_quantum_network(n_routers, output_file, config):
     # Add routers
     for i in range(1, num_routers + 1):
         router_name = f"r{i}"
-        network["nodes"].append({"name": router_name, "type": "QuantumRouter", "seed": 1, "memo_size": 1000})#int(C[i-1]+C[i])})
+        network["nodes"].append({"name": router_name, "type": "QuantumRouter", "seed": 1, "memo_size": 500})#int(C[i-1]+C[i])})
     
     # Add end node
     network["nodes"].append({"name": "Nodej", "type": "QuantumRouter", "seed": 1 , "memo_size": 500})#int(C[num_routers])})
@@ -112,9 +112,6 @@ class EnranglementRequestApp(RequestApp):
             #print("\t{} app received memory {} ENTANGLED at time {}".format(self.node.name, info.index, self.node.timeline.now() * 1e-12))
             self.memory_counter += 1
             self.accumulated_fidelity += info.fidelity
-            
-            print(f"time of update Eg in {self.node.name} is {self.node.timeline.now()}")
-            print(f"time of eg {info.entangle_time}")
             self.node.resource_manager.update(None, info.memory, "RAW")
             if self.memory_counter >= N:
                 self.end_t = self.node.timeline.now()
@@ -156,7 +153,6 @@ class ResetApp:
         """
         if (info.state == "ENTANGLED" and info.remote_node == self.other_node_name
                 and info.fidelity > self.target_fidelity):
-            print(f"time of update Eg in {self.node.name} is {self.node.timeline.now()}")
             self.node.resource_manager.update(None, info.memory, "RAW")
 
 def set_parameters(topology: RouterNetTopo, config):
@@ -201,10 +197,12 @@ def get_router_state(r, memo_index=None):
             print("{:6}\t{:15}\t{:9}\t{}".format(str(i), str(info.remote_node),
                                                   str(info.fidelity), str(info.entangle_time * 1e-12)))
     
-def simulate(network_topology,config,swapping_order = None, target_fidelity = 0.1):
-    if swapping_order: 
-        Reservation.swapping_order = swapping_order
-        ResourceReservationProtocol.create_rules = create_rules
+def simulate(network_topology,config,link_capacity=None,swapping_order = None, target_fidelity = 0.1):
+
+    Reservation.link_capacity = link_capacity
+    Reservation.swapping_order = swapping_order
+    ResourceReservationProtocol.create_rules = create_rulesASAP
+    
     
     network_topo = RouterNetTopo(network_topology)
     #set the simulation parametters
@@ -215,7 +213,7 @@ def simulate(network_topology,config,swapping_order = None, target_fidelity = 0.
 
     start_node_name = "Nodei"
     end_node_name = "Nodej"
-    #r3_name = "r3"
+    r3_name = "r3"
     node_names = network_topo.get_nodes_by_type(RouterNetTopo.QUANTUM_ROUTER)
     for router in node_names:
         if router.name == start_node_name:
@@ -223,15 +221,15 @@ def simulate(network_topology,config,swapping_order = None, target_fidelity = 0.
         elif router.name == end_node_name:
             node2 = router
         ###
-        """elif router.name == r3_name:
-            r3 = router"""
-    #tracker = trackApp(r3)
+        elif router.name == r3_name:
+            r3 = router
+    tracker = trackApp(node1)
     ###
     app_node1 = EnranglementRequestApp(node1, end_node_name)
     reset_app = ResetApp(node2, start_node_name)
 
     start_time = 0.1e12
-    end_time = 60e12
+    end_time = 0.2e12
 
     tl.init()
     memory_number = 1
@@ -263,9 +261,9 @@ config = configparser.ConfigParser()
 config.read(config_path)
 
 topology_file = 'temp_topology.json'
-
-swapping_order = ['r1', 'r3']
-create_quantum_network(topology_file, config)
-print(simulate(topology_file, config))#, C, swapping_order))
+C= np.array([1,1,1,1])
+swapping_order = ['r1', 'r3', 'r2']
+create_quantum_network(C,topology_file, config)
+print(simulate(topology_file, config, C, swapping_order))
 
 
