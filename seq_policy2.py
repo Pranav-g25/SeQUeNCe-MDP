@@ -4,18 +4,21 @@ import sys, os, time
 from math import inf
 
 from enum import Enum, auto
-
+from sequence.components.memory import Memory
+from sequence.components.circuit import Circuit
+from typing import TYPE_CHECKING, List
+from sequence.utils import log
 
 from sequence.topology.node import Node
 from sequence.components.memory import MemoryWithRandomCoherenceTime
-from sequence.entanglement_management.generation import EntanglementGenerationA, GenProtoStatus
+from sequence.entanglement_management.generation import EntanglementGenerationA
 from sequence.kernel.timeline import Timeline
 from sequence.kernel.process import Process
 from sequence.kernel.event import Event
 from sequence.topology.node import BSMNode
 from sequence.components.optical_channel import QuantumChannel, ClassicalChannel
 from sequence.entanglement_management.entanglement_protocol import EntanglementProtocol
-from sequence.entanglement_management.swapping import EntanglementSwappingA, EntanglementSwappingB
+from sequence.entanglement_management.swapping import EntanglementSwappingMessage, SwappingMsgType, EntanglementSwappingA, EntanglementSwappingB
 from sequence.resource_management.resource_manager import ResourceManagerMessage, ResourceManagerMsgType
 from sequence.message import Message
 
@@ -28,8 +31,9 @@ class policy():
         self.states = []
         self.action_spaces = []
         self.policies = []
-        self.N = len(policy_data['state_info'])
-        for i in range(self.N):
+        self.N = len(np.array(policy_data['state_info'][0]['state'])[0,:])
+        self.NumOfStates = len(policy_data['state_info'])
+        for i in range(self.NumOfStates):
             self.states.append(np.array(policy_data['state_info'][i]['state']))
             self.action_spaces.append(policy_data['state_info'][i]['action_space'])
             self.policies.append(policy_data['state_info'][i]['policy'])
@@ -50,6 +54,9 @@ class ControlNodeMessage(Message):
         self.origin = _origin
         if msg_type is ControlNodeMsgType.LINK_STATUS_UPDATED:
             self.established = kwargs[ 'established' ] if 'established' in kwargs else True
+            self.left = kwargs['left'] if 'left' in kwargs else None
+            self.right = kwargs['right'] if 'right' in kwargs else None
+            self.middle = kwargs['middle'] if 'middle' in kwargs else None
             pass
         else:
             raise Exception("ControlNodeMessage gets unknown type of message: %s" % str(msg_type))
@@ -61,21 +68,37 @@ class ControlNodeData():
         self.numLinksToBeUpdatedAtThisSession = None
         self.policy : policy = None
         self.current_state : np.array = None
+        self.current_action = None
+        self.t_cut = None
+        self.numSwapsToBeUpdatedAtThisSession = None
+        self.numSwapsUpdated = 0 
 
     def addPolicy(self,_policy):
         self.policy = _policy
-        self.current_state = _policy.states[0]
+        self.current_state = np.full((_policy.N, _policy.N), -1)
+        self.terminal_states = [] 
+        for i in range(self.t_cut):
+             a = np.full((_policy.N, _policy.N), - 1)
+             a[0,_policy.N - 1] = a[_policy.N - 1, 0] = i
+             self.terminal_states.append(a)
+
     
     def findActionForCurrentStateAccToPolicy(self, _state : np.array) -> list[int]:
-        try:
-            state_index : int = self.policy.states.index(_state)
-        except ValueError:
-            print("could not find a matching state")
-        
+        state_index = 0
+    
+        for i in range(len(self.policy.states)):
+            if ((self.policy.states[i] == _state).all()):
+                state_index = i
+                break
         _action_space = self.policy.action_spaces[state_index]
         _policy = self.policy.policies[state_index]
+        print('action space :        ', _action_space)
+        return _action_space[_policy.index(1.0)]
 
-        return _action_space[_policy.index(1)]
+    def reset(self):
+        self.numSwapsToBeUpdatedAtThisSession = None
+        self.numSwapsUpdated = 0
+        self.current_state = np.full((self.policy.N, self.policy.N), -1)
         
 class Link():
     def __init__(self, _nodesNos =None):
@@ -92,6 +115,17 @@ class Link():
         self.genProtocolFinished = False
         self.established = False
         self.memoryExpired = False
+    
+    def copy_from( self, _other ):
+        self.node_left = _other.node_left
+        self.node_right = _other.node_right
+        self.node_left_memo_updated = _other.node_left_memo_updated
+        self.node_right_memo_updated = _other.node_right_memo_updated
+        self.genProtocolFinished = _other.genProtocolFinished
+        self.established = _other.established
+        self.memoryExpired = _other.memoryExpired
+            
+        return self
 
 class SimpleManager():
     def __init__(self, _owner, _nodesTracker):
@@ -122,7 +156,9 @@ class SimpleManager():
                 raise ValueError( 'Wrong protocol name: %s' % protocol.name )
 
     def update_eg( self, protocol, memory, state ):
+        _nodes  = self.nodesTracker.nodes
         _memo_id = None
+        _established = None
         if memory.name == self.leftMemoName:
             _memo_id = 0
             #self.updated[0] = True
@@ -131,192 +167,32 @@ class SimpleManager():
             #self.updated[1] = True
         else:
             raise ValueError( 'I don\'t have another sides of a node' )
-            
-        #if self.nodesTracker.blockResourceManagerUpdating:
-        #    return
         
-        _nodes = self.nodesTracker.nodes
-        #_memosToTrack = self.nodesTracker.memosToTrack
-        _cnodeNo = self.nodesTracker.cnodeNo
-        _numRouters = self.nodesTracker.numRouters
-        
-        #_lastProtoEvent = _nodes[2*self.nodeNo].isTheLastProtocolEvent(_memo_id)
-        _protocol_status = self.owner.protocols[_memo_id].status
-            
-        #print( _memosToTrack, self.nodeNo, _memo_id )
-        
-        if doDubugOutput:
-            print( 'protofol status:', str( _protocol_status ) )
-            print( '########### UPDATE generation ###################' )
-            print( 'memory state:', state, 'memory name:', memory.name )
-            _time_now = self.nodesTracker.tl.now()
-            print( 'time:', _time_now )
-            #if _time_now == 301012510:
-            #    print( 'Let\'s break here' )
-            for j in range( 1, self.nodesTracker.numRouters + 2 ):
-                print( _nodes[2*j].left_memo.entangled_memory,
-                       _nodes[2*j-2].right_memo.entangled_memory )
+        _remote_node_name = None
+        _remote_node_no = None
 
-        _found = None
-        _remote_nodeNo = None
+        if state == 'RAW':
+            _established = False
         
-        for _i in range( len( self.nodesTracker.links ) ):
-            _l = self.nodesTracker.links[ _i ]
-            _found = False
-            if _memo_id == 1 and self.nodeNo == _l.node_left:
-                if ( _protocol_status is GenProtoStatus.ENDING or
-                     _protocol_status is GenProtoStatus.MEMORY_EXPIRED ):#_lastProtoEvent:
-                    if not _l.node_left_memo_updated:
-                        _l.node_left_memo_updated = True
-                        _found = True
-                _remote_nodeNo = _l.node_right
-            elif _memo_id == 0 and self.nodeNo == _l.node_right:
-                if ( _protocol_status is GenProtoStatus.ENDING or
-                     _protocol_status is GenProtoStatus.MEMORY_EXPIRED ):
-                    if not _l.node_right_memo_updated:
-                        _l.node_right_memo_updated = True
-                        _found = True
-                _remote_nodeNo = _l.node_left
-            else:
-                continue
-            
-            if _found:
-                if _protocol_status is GenProtoStatus.MEMORY_EXPIRED:
-                    #print( str( GenProtoStatus.MEMORY_EXPIRED ) )
-                    if not _l.memoryExpired:
-                        _l.memoryExpired = True
-                
-                #_linkWasUpdated = False
-                _established = False
-                #_updated_link = Link()
-                #print( _updated_link.node_left_memo_updated, _updated_link.node_right_memo_updated )
-                if _l.node_left_memo_updated and _l.node_right_memo_updated:
-                    _node_right_name1 = _nodes[2*_l.node_left].right_memo.entangled_memory['node_id']
-                    _node_left_name1 = _nodes[2*_l.node_right].left_memo.entangled_memory['node_id']
-                    
-                    if _node_right_name1 is None and _node_left_name1 is None:
-                        #self.nodesTracker.numGeneratedLinksReported += 1
-                        _l.genProtocolFinished = True
-                    elif not ( _node_right_name1 is None or _node_left_name1 is None ):
-                        #self.nodesTracker.numGeneratedLinksReported += 1
-                        _l.genProtocolFinished = True
-                        _l.established = True
-                        _established = True
-                        #raise ValueError( self.nodesTracker.links[ _i ].genProtocolFinished )
-                        
-                        ######### just doing more double checks ##################
-                        if _memo_id == 1:
-                            _remote_node_name1 = _nodes[2*self.nodeNo].right_memo.entangled_memory['node_id']
-                        elif _memo_id == 0:
-                            _remote_node_name1 = _nodes[2*self.nodeNo].left_memo.entangled_memory['node_id']
-                        else:
-                            raise ValueError( 'Wrong memory id: %d' % _memo_id 
-                                             )
-                        _remote_nodeNo1 = int( _remote_node_name1[4:] )
-                        try:
-                            assert _remote_nodeNo1 == _remote_nodeNo
-                            if _memo_id == 0:
-                                _node_name1 = _nodes[2*_remote_nodeNo].right_memo.entangled_memory['node_id']
-                            elif _memo_id == 1:
-                                _node_name1 = _nodes[2*_remote_nodeNo].left_memo.entangled_memory['node_id']
-                            else:
-                                raise ValueError( 'Wrong memory id: %d' % _memo_id )
-                            
-                            _nodeNo1 = int( _node_name1[4:] )
-                            assert _nodeNo1 == self.nodeNo
-                        except AssertionError as e:
-                            print( 'link between:', _l.node_left, 'and', _l.node_right )
-                            print( _nodes[2*self.nodeNo].right_memo.entangled_memory if _memo_id == 1
-                                  else _nodes[2*self.nodeNo].right_memo.entangled_memory )
-                            print( _nodes[2*_remote_nodeNo].left_memo.entangled_memory if _memo_id == 1
-                                  else _nodes[2*_remote_nodeNo].right_memo.entangled_memory )
-                            raise AssertionError( e )
-                          
-                        self.nodesTracker.establishedLinks.append( Link().copy_from( _l ) )
-                        self.nodesTracker.links.pop(_i)
-                        
-                    #self.nodesTracker.numGeneratedLinksReported += 1
-                    #                    
-                    #_remote_node_name1 = _nodes[2*self.nodeNo].right_memo.entangled_memory['node_id']
-                    #_established = False
-                    #if not _remote_node_name1 is None:
-                    #    _remote_nodeNo1 = int( _remote_node_name1[4:] )
-                    #    assert _remote_nodeNo1 == _remote_nodeNo
-                    #    _node_name1 = _nodes[2*_remote_nodeNo].right_memo.entangled_memory['node_id']
-                    #    if not _node_name1 is None:
-                    #        _nodeNo1 = int( _node_name1[4:] )
-                    #        assert _nodeNo1 == self.nodeNo
-                    #        _established = True
-                    #
-                    #        self.nodesTracker.establishedLinks.append( _l )
-                    #        self.nodesTracker.links.pop(_i)
-                    
-                    #if _established:
-                    #    srcNodeNo = None
-                    #    if abs( self.nodeNo - self.nodesTracker.cnodeNo ) < abs( _remote_nodeNo - self.nodesTracker.cnodeNo ):
-                    #        srcNodeNo = self.nodeNo
-                    #    elif abs( self.nodeNo - self.nodesTracker.cnodeNo ) > abs( _remote_nodeNo - self.nodesTracker.cnodeNo ):
-                    #        srcNodeNo = _remote_nodeNo
-                    #    else:
-                    #        raise ValueError( 'That can\'t happen' )
-                    #        
-                    #    msg = ControlNodeMessage( ControlNodeMsgType.LINK_WAS_ESTABLISHED, 'generation' )        
-                    #    if srcNodeNo != self.nodesTracker.cnodeNo:
-                    #        _nodes[2*srcNodeNo].send_message( _nodes[2*self.nodesTracker.cnodeNo].name, msg )
-                    #    else:
-                    #        self.owner.receive_message( self.owner.name, msg )
-                    #    #print( 'established fuck you shit' )
-                break
+        elif state == 'ENTANGLED':
+            _established = True
         
-        if not _found:
-            return
-        
-        ##_protocol_status = self.owner.protocols[_memo_id].status
-        _updated_link = self.nodesTracker.establishedLinks[ -1 ] if _established else self.nodesTracker.links[ _i ]
-        if _updated_link.genProtocolFinished:
-            srcNodeNo = None
-            assert ( _updated_link.node_left == self.nodeNo and _updated_link.node_right == _remote_nodeNo or
-                    _updated_link.node_left == _remote_nodeNo and _updated_link.node_right == self.nodeNo )
-            if abs( self.nodeNo - self.nodesTracker.cnodeNo ) < abs( _remote_nodeNo - self.nodesTracker.cnodeNo ):
-                srcNodeNo = self.nodeNo
-            elif abs( self.nodeNo - self.nodesTracker.cnodeNo ) > abs( _remote_nodeNo - self.nodesTracker.cnodeNo ):
-                srcNodeNo = _remote_nodeNo
-            else:
-                raise ValueError( 'That can\'t happen' )
-                            
-            msg = ControlNodeMessage( ControlNodeMsgType.LINK_STATUS_UPDATED, 'generation', established = _updated_link.established )        
+        _remote_node_name = self.owner.protocols[_memo_id].remote_node_name
+        _remote_node_no = int(_remote_node_name[4:])
+
+        srcNodeNo = None
+
+        if (self.nodeNo >_remote_node_no):
+            srcNodeNo = self.nodeNo
+            msg = ControlNodeMessage( ControlNodeMsgType.LINK_STATUS_UPDATED, 'generation', established = _established )
             if srcNodeNo != self.nodesTracker.cnodeNo:
                 _nodes[2*srcNodeNo].send_message( _nodes[2*self.nodesTracker.cnodeNo].name, msg )
             else:
                 self.nodesTracker.cnode.receive_message( _nodes[2*srcNodeNo].name, msg )
-        #if ( _updated_link_ref.node_left_memo_updated and _updated_link_ref.node_right_memo_updated and
-        #    self.nodesTracker.numGeneratedLinksReported == self.nodesTracker.numLinksToBeUpdatedAtThisSession ):
-        #    _linksLeftToEstablish = len( self.nodesTracker.links )
-        #    #print( 'linksLeftToEstablish', _linksLeftToEstablish )
-        #    if _linksLeftToEstablish > 0:
-        #        #self.nodesTracker.numLinksToBeUpdatedAtThisSession = len( self.nodesTracker.links )
-        #        #self.nodesTracker.numGeneratedLinksReported = 0
-        #        #self.nodesTracker.flushAllPendingEvents()
-        #        for j in range( 1, _numRouters + 1 ):
-        #            _nodes[2*j-2].protocols[1].status = GenProtoStatus.INITIALIZED
-        #            _nodes[2*j].protocols[0].status = GenProtoStatus.INITIALIZED
-        #        _have_expired_memories = False
-        #        for _l in self.nodesTracker.links:
-        #            if _l.memoryExpired == True:
-        #                _have_expired_memories = True
-        #                break
-        #        _time_to_wait = ( 0.55 * self.nodesTracker.endnode_distance / self.nodesTracker.light_speed 
-        #                         / ( self.nodesTracker.numRouters + 1 ) if _have_expired_memories else 1 ) 
-        #                            # 0.5+ is because once 
-        #                            #memory expired, it voids emitted photon, but if it had reached bsm node and the bsm 
-        #                            #sent the measurements results, nobody voids that message, so we just have to wait 
-        #                            #once it's delivered and ignored by resource_manager.update() due to the protocol's 
-        #                            #state INITIALIZED
-        #        
-        #        self.nodesTracker.tl.schedule( Event( self.nodesTracker.tl.now() + _time_to_wait, 
-        #                                             self.nodesTracker.process ) )
             
     def update_es_new(self, protocol, memory, state):
+        print('update_es_new called by :   ', self.owner.name, 'with state:', state, 'with protocol name:', protocol.name)
+        _nodes  = self.nodesTracker.nodes
         _memo_id = None
         if memory.name == self.leftMemoName:
             _memo_id = 0
@@ -325,12 +201,36 @@ class SimpleManager():
             _memo_id = 1
             #self.updated[1] = True
         
-        if state == 'RAW':
-            memory.reset()
+        if protocol.name[-3:] == 'ESA':
+            if _memo_id == 0:
+                midNodeName = self.owner.name
+                leftNodeName = self.owner.protocols[2].left_node
+                rightNodeName = self.owner.protocols[2].right_node
+                midNodeNo = int(midNodeName[4:])
+                leftNodeNo = int(leftNodeName[4:])
+                rightNodeNo = int(rightNodeName[4:])
+                _established = None
+                if state == 'NOTSwapped':
+                    _established = False
+                    self.owner.protocols[2].left_memo.reset()
+                    self.owner.protocols[2].right_memo.reset()
+                    self.nodesTracker.nodes[2*leftNodeNo].right_memo.reset()
+                    self.nodesTracker.nodes[2*rightNodeNo].left_memo.reset()
+                if state == 'SWAPPED':
+                    _established = True
+                    self.owner.protocols[2].left_memo.reset()
+                    self.owner.protocols[2].right_memo.reset()
+                    self.nodesTracker.nodes[2*leftNodeNo].right_memo.entangled_memory["node_id"] = rightNodeName
+                    self.nodesTracker.nodes[2*rightNodeNo].left_memo.entangled_memory["node_id"] = leftNodeName
 
-        if state == 'ENTANGLED':
-            self.nodeNo
-        
+                print("Cnode swapping msg sent to be:    ", _established)
+                msg = ControlNodeMessage( ControlNodeMsgType.LINK_STATUS_UPDATED, 'swapping', established = _established , middle = midNodeNo, left =  leftNodeNo, right = rightNodeNo )        
+                if midNodeNo != self.nodesTracker.cnodeNo:
+                    _nodes[2*midNodeNo].send_message( _nodes[2*self.nodesTracker.cnodeNo].name, msg )
+                else:
+                    self.nodesTracker.cnode.receive_message( _nodes[2*midNodeNo].name, msg )
+        else:
+            pass
 
     def update_es( self, protocol, memory, state ):
         _memo_id = None
@@ -480,11 +380,13 @@ class EntangleGenNode(Node):
         if len( msg_type ) >= 15:
             if msg_type[:15] == 'SwappingMsgType':
                 if len(src) > len( 'node' ): 
-                    if src[:4] == 'node':
-                        if int( src[4:] ) > int( self.name[4:] ):
-                            self.protocols[3].received_message(src, msg)
-                        elif int( src[4:] ) < int( self.name[4:] ):
-                            self.protocols[2].received_message(src, msg)
+                    pass
+                    # print("############################################################### Msg received at ", self.name, "from", src)
+                    # if src[:4] == 'node':
+                    #     if int( src[4:] ) > int( self.name[4:] ):
+                    #         self.protocols[3].received_message(src, msg)
+                    #     elif int( src[4:] ) < int( self.name[4:] ):
+                    #         self.protocols[2].received_message(src, msg)
                 return
             
         if type( msg.msg_type ) is ControlNodeMsgType:
@@ -493,29 +395,43 @@ class EntangleGenNode(Node):
                     _nodesTracker = self.resource_manager.nodesTracker
                     _nodes = _nodesTracker.nodes
                     _cnodeData = _nodesTracker.cnode.cnodeData
-                    
+                    srcNodeNo = int(src[4:])
                     _cnodeData.genLinksUpdated += 1
                     if msg.established:
                         _cnodeData.genLinksEstablished += 1
-                        _cnodeData.current_state[self.resource_manager.nodeNo, self.resource_manager.nodeNo - 1] \
-                              = _cnodeData.current_state[self.resource_manager.nodeNo - 1, self.resource_manager.nodeNo] = 0
+                        _cnodeData.current_state[srcNodeNo, srcNodeNo - 1] \
+                              = _cnodeData.current_state[srcNodeNo - 1, srcNodeNo] = 0
                     
                     else:
-                        _nodesTracker.linksForNextSession.append( Link( ( self.resource_manager.nodeNo - 1, self.resource_manager.nodeNo ) ) )
+                        _nodesTracker.linksForNextSession.append( Link( ( srcNodeNo - 1, srcNodeNo ) ) )
                     
                     if _cnodeData.genLinksUpdated == _cnodeData.numLinksToBeUpdatedAtThisSession:
                         _nodesTracker.links.clear()
-                        _nodesTracker.links = _nodesTracker.linksForNextSession
-
-                        _action = _cnodeData.findActionForCurrentStateAccToPolicy(_cnodeData.current_state)
-
-                        _process = Process( _nodesTracker, 'doAction',[ _action] )
-                        _nodesTracker.updateProcessToSchedule( _process )
+                        for i in range(len(_nodesTracker.linksForNextSession)):
+                            _nodesTracker.links.append( _nodesTracker.linksForNextSession[i])
+                        _nodesTracker.linksForNextSession.clear()
+                        _cnodeData.current_action = _cnodeData.findActionForCurrentStateAccToPolicy(_cnodeData.current_state)
+                        _cnodeData.numSwapsToBeUpdatedAtThisSession = len(_cnodeData.current_action)
+                        print("state and action", _cnodeData.current_state, _cnodeData.current_action)
+                        #######################################################################################################
+                        #######################################################################################################
+                        #######################################################################################################
+                        #######################################################################################################
+                        #######################################################################################################
+                        #######################################################################################################
+                        _process1 = Process( _nodesTracker, 'doAction',[ _cnodeData.current_action, _cnodeData.numSwapsUpdated] )
+                        _nodesTracker.updateProcessToSchedule( _process1 )
                         _time_to_wait = ( _nodesTracker.signalingDelay + 1 #0.5*_nodesTracker.endnode_distance/_nodesTracker.light_speed
                                               if _nodesTracker.numRouters > 0
                                               else 1 )
                         _nodesTracker.tl.schedule( Event( _nodesTracker.tl.now() + _time_to_wait,
-                                                              _process ) )
+                                                              _process1 ) )
+                        
+                        
+                        
+                        
+
+                        
                     '''            
                     else:
                         for j in range( 1, _nodesTracker.numRouters + 1 ):
@@ -528,16 +444,47 @@ class EntangleGenNode(Node):
                         _nodesTracker.flushTotallyAllPendingEvents()
                         _nodesTracker.result = False
                             #print( 'dbg: cnode received gen failed:',  _nodesTracker.tl.now() * _nodesTracker.light_speed / _nodesTracker.endnode_distance )'''
-                '''
-                elif msg.msg_type is ControlNodeMsgType.ESTABLISHED_LINK_WAS_BROKEN:
-                _nodesTracker = self.resource_manager.nodesTracker
-                _nodesTracker.resetAllMemories()
-                _nodesTracker.flushTotallyAllPendingEvents()
-                _nodesTracker.resetNodesUpdatesFlags()
-                _nodesTracker.result = False
-                '''
-            else:
-                raise ValueError( 'I don\'t expext this msg_type: %s' % msg_type )
+                elif msg.origin == 'swapping':
+                    _nodesTracker = self.resource_manager.nodesTracker
+                    _nodes = _nodesTracker.nodes
+                    _cnodeData = _nodesTracker.cnode.cnodeData
+
+                    leftNodeNo = msg.left
+                    midNodeNo = msg.middle
+                    rightNodeNo = msg.right
+
+                    if msg.established:
+                        print("Swapping established on :           ",midNodeNo )
+                        _cnodeData.current_state[leftNodeNo, rightNodeNo] = _cnodeData.current_state[rightNodeNo, leftNodeNo] = \
+                            max(_cnodeData.current_state[leftNodeNo, midNodeNo], _cnodeData.current_state[midNodeNo, rightNodeNo])
+                        
+                    else:
+                        print("Swapping failed on :           ",midNodeNo )
+                        for i in range(1, abs(leftNodeNo - rightNodeNo) + 1):
+                            _nodesTracker.links.append(Link((leftNodeNo + i - 1, leftNodeNo + i)))
+                    
+                    _cnodeData.current_state[leftNodeNo, midNodeNo] = _cnodeData.current_state[midNodeNo, leftNodeNo] = \
+                        _cnodeData.current_state[midNodeNo, rightNodeNo] =_cnodeData.current_state[rightNodeNo, midNodeNo] = -1
+                    
+
+                    _time_to_wait = 1
+                    if _cnodeData.numSwapsUpdated == _cnodeData.numSwapsToBeUpdatedAtThisSession:
+                        _cnodeData.numSwapsUpdated = 0
+                        _process2 = Process( _nodesTracker, 'postAction',[])
+                        _nodesTracker.tl.schedule( Event( _nodesTracker.tl.now() + _time_to_wait,
+                                                              _process2 ) )    
+                    else:
+                        _process = Process(_nodesTracker, 'doAction', [_cnodeData.current_action, _cnodeData.numSwapsUpdated])
+                        _nodesTracker.tl.schedule( Event(_nodesTracker.tl.now() + _time_to_wait, _process))
+
+            '''
+            elif msg.msg_type is ControlNodeMsgType.ESTABLISHED_LINK_WAS_BROKEN:
+            _nodesTracker = self.resource_manager.nodesTracker
+            _nodesTracker.resetAllMemories()
+            _nodesTracker.flushTotallyAllPendingEvents()
+            _nodesTracker.resetNodesUpdatesFlags()
+            _nodesTracker.result = False
+            '''
         else:
             raise ValueError( 'Don\'t know what message has been received:', msg_type, src )
             
@@ -592,13 +539,13 @@ class EntangleGenNode(Node):
             raise ValueError( 'Bad memory index: %d' % memo_id )
 
     def create_es_protocol_middle( self, _swapping_params ):
-        self.protocols[2] = EntanglementSwappingA(self, '%s.ESA'%self.name, self.left_memo, self.right_memo, **_swapping_params)
+        self.protocols[2] = EntanglementSwappingA_global(self, '%s.ESA'%self.name, self.left_memo, self.right_memo, **_swapping_params)
 
     def create_es_protocol_ends( self, memo_id: int ):
         if memo_id == 0:
-            self.protocols[2] = EntanglementSwappingB(self, '%s.ESB.r'%self.name, self.left_memo)
+            self.protocols[2] = EntanglementSwappingB_global(self, '%s.ESB.r'%self.name, self.left_memo)
         elif memo_id == 1:
-            self.protocols[3] = EntanglementSwappingB(self, '%s.ESB.l'%self.name, self.right_memo)
+            self.protocols[3] = EntanglementSwappingB_global(self, '%s.ESB.l'%self.name, self.right_memo)
         else:
             raise ValueError( 'Bad memory index: %d' % memo_id )
             
@@ -649,6 +596,318 @@ def pair_es_protocol(p1, p2):
     p1.set_others( p2.name, p2.own.name ,p2.own.left_memo.name )
     p2.set_others( p1.name, p1.own.name, p1.own.left_memo.name )
 
+class EntanglementSwappingA_global(EntanglementProtocol):
+    """Entanglement swapping protocol for middle router.
+
+    The entanglement swapping protocol is an asymmetric protocol.
+    EntanglementSwappingA should be instantiated on the middle node, where it measures a memory from each pair to be swapped.
+    Results of measurement and swapping are sent to the end routers.
+
+    Variables:
+        EntanglementSwappingA.circuit (Circuit): circuit that does swapping operations.
+
+    Attributes:
+        own (Node): node that protocol instance is attached to.
+        name (str): label for protocol instance.
+        left_memo (Memory): a memory from one pair to be swapped.
+        right_memo (Memory): a memory from the other pair to be swapped.
+        left_node (str): name of node that contains memory entangling with left_memo.
+        left_remote_memo (str): name of memory that entangles with left_memo.
+        right_node (str): name of node that contains memory entangling with right_memo.
+        right_remote_memo (str): name of memory that entangles with right_memo.
+        success_prob (float): probability of a successful swapping operation.
+        degradation (float): degradation factor of memory fidelity after swapping.
+        is_success (bool): flag to show the result of swapping
+        left_protocol_name (str): name of left protocol.
+        right_protocol_name (str): name of right protocol.
+    """
+
+    circuit = Circuit(2)
+    circuit.cx(0, 1)
+    circuit.h(0)
+    circuit.measure(0)
+    circuit.measure(1)
+
+    def __init__(self, own: "Node", name: str, left_memo: "Memory", right_memo: "Memory", success_prob=1,
+                 degradation=0.95):
+        """Constructor for entanglement swapping A protocol.
+
+        Args:
+            own (Node): node that protocol instance is attached to.
+            name (str): label for swapping protocol instance.
+            left_memo (Memory): memory entangled with a memory on one distant node.
+            right_memo (Memory): memory entangled with a memory on the other distant node.
+            success_prob (float): probability of a successful swapping operation (default 1).
+            degradation (float): degradation factor of memory fidelity after swapping (default 0.95).
+        """
+
+        assert left_memo != right_memo
+        EntanglementProtocol.__init__(self, own, name)
+        self.memories = [left_memo, right_memo]
+        self.left_memo = left_memo
+        self.right_memo = right_memo
+        self.left_node = left_memo.entangled_memory['node_id']
+        self.left_remote_memo = left_memo.entangled_memory['memo_id']
+        self.right_node = right_memo.entangled_memory['node_id']
+        self.right_remote_memo = right_memo.entangled_memory['memo_id']
+        self.success_prob = success_prob
+        self.degradation = degradation
+        self.is_success = False
+        self.left_protocol_name = None
+        self.right_protocol_name = None
+
+    def is_ready(self) -> bool:
+        return self.left_protocol_name is not None \
+               and self.right_protocol_name is not None
+
+    def set_others(self, protocol: str, node: str, memories: List[str]) -> None:
+        """Method to set other entanglement protocol instance.
+
+        Args:
+            protocol (str): other protocol name.
+            node (str): other node name.
+            memories (List[str]): the list of memories name used on other node.
+        """
+
+        if node == self.left_memo.entangled_memory["node_id"]:
+            self.left_protocol_name = protocol
+        elif node == self.right_memo.entangled_memory["node_id"]:
+            self.right_protocol_name = protocol
+        else:
+            raise Exception("Cannot pair protocol %s with %s" % (self.name, protocol))
+
+    def start(self) -> None:
+        """Method to start entanglement swapping protocol.
+
+        Will run circuit and send measurement results to other protocols.
+
+        Side Effects:
+            Will call `update_resource_manager` method.
+            Will send messages to other protocols.
+        """
+
+        log.logger.info(f"{self.own.name} middle protocol start with ends "
+                        f"{self.left_protocol_name}, "
+                        f"{self.right_protocol_name}")
+
+        assert self.left_memo.fidelity > 0 and self.right_memo.fidelity > 0
+        assert self.left_memo.entangled_memory["node_id"] == self.left_node
+        assert self.right_memo.entangled_memory["node_id"] == self.right_node
+
+        if self.own.get_generator().random() < self.success_probability():
+            fidelity = self.updated_fidelity(self.left_memo.fidelity, self.right_memo.fidelity)
+            self.is_success = True
+
+            expire_time = min(self.left_memo.get_expire_time(), self.right_memo.get_expire_time())
+
+            meas_samp = self.own.get_generator().random()
+            meas_res = self.own.timeline.quantum_manager.run_circuit(
+                self.circuit, [self.left_memo.qstate_key,
+                               self.right_memo.qstate_key], meas_samp)
+            meas_res = [meas_res[self.left_memo.qstate_key], meas_res[self.right_memo.qstate_key]]
+
+            msg_l = EntanglementSwappingMessage(SwappingMsgType.SWAP_RES,
+                                                self.left_protocol_name,
+                                                fidelity=fidelity,
+                                                remote_node=self.right_memo.entangled_memory["node_id"],
+                                                remote_memo=self.right_memo.entangled_memory["memo_id"],
+                                                expire_time=expire_time,
+                                                meas_res=[])
+            msg_r = EntanglementSwappingMessage(SwappingMsgType.SWAP_RES,
+                                                self.right_protocol_name,
+                                                fidelity=fidelity,
+                                                remote_node=self.left_memo.entangled_memory["node_id"],
+                                                remote_memo=self.left_memo.entangled_memory["memo_id"],
+                                                expire_time=expire_time,
+                                                meas_res=meas_res)
+            self.update_resource_manager(self.left_memo, "SWAPPED")
+            self.update_resource_manager(self.right_memo, "SWAPPED")
+
+        else:
+            msg_l = EntanglementSwappingMessage(SwappingMsgType.SWAP_RES,
+                                                self.left_protocol_name,
+                                                fidelity=0)
+            msg_r = EntanglementSwappingMessage(SwappingMsgType.SWAP_RES,
+                                                self.right_protocol_name,
+                                                fidelity=0)
+            self.update_resource_manager(self.left_memo, "NOTSwapped")
+            self.update_resource_manager(self.right_memo, "NOTSwapped")
+            
+        self.own.send_message(self.left_node, msg_l)
+        print("###Swapping msg sent from", self.own.name, "to", self.left_node)
+        self.own.send_message(self.right_node, msg_r)
+        print("###Swapping msg sent from", self.own.name, "to", self.right_node)
+
+    def success_probability(self) -> float:
+        """A simple model for BSM success probability."""
+
+        return self.success_prob
+
+    #@lru_cache(maxsize=128)
+    def updated_fidelity(self, f1: float, f2: float) -> float:
+        """A simple model updating fidelity of entanglement.
+
+        Args:
+            f1 (float): fidelity 1.
+            f2 (float): fidelity 2.
+
+        Returns:
+            float: fidelity of swapped entanglement.
+        """
+
+        return f1 * f2 * self.degradation
+
+    def received_message(self, src: str, msg: "Message") -> None:
+        """Method to receive messages (should not be used on A protocol)."""
+
+        raise Exception("EntanglementSwappingA protocol '{}' should not receive messages.".format(self.name))
+
+    def memory_expire(self, memory: "Memory") -> None:
+        """Method to receive memory expiration events.
+
+        Releases held memories on current node.
+        Memories at the remote node are released as well.
+
+        Args:
+            memory (Memory): memory that expired.
+
+        Side Effects:
+            Will invoke `update` method of attached resource manager.
+            Will invoke `release_remote_protocol` or `release_remote_memory` method of resource manager.
+        """
+
+        assert self.is_ready() is True
+        if self.left_protocol_name:
+            self.release_remote_protocol(self.left_node)
+        else:
+            self.release_remote_memory(self.left_node, self.left_remote_memo)
+        if self.right_protocol_name:
+            self.release_remote_protocol(self.right_node)
+        else:
+            self.release_remote_memory(self.right_node, self.right_remote_memo)
+
+        for memo in self.memories:
+            if memo == memory:
+                self.update_resource_manager(memo, "RAW")
+            #else:
+                #self.update_resource_manager(memo, "ENTANGLED")
+
+    def release_remote_protocol(self, remote_node: str):
+        self.own.resource_manager.release_remote_protocol(remote_node, self)
+
+    def release_remote_memory(self, remote_node: str, remote_memo: str):
+        self.own.resource_manager.release_remote_memory(remote_node, remote_memo)
+
+class EntanglementSwappingB_global(EntanglementProtocol):
+    """Entanglement swapping protocol for middle router.
+
+    The entanglement swapping protocol is an asymmetric protocol.
+    EntanglementSwappingB should be instantiated on the end nodes, where it waits for swapping results from the middle node.
+
+    Variables:
+        EntanglementSwappingB.x_cir (Circuit): circuit that corrects state with an x gate.
+        EntanglementSwappingB.z_cir (Circuit): circuit that corrects state with z gate.
+        EntanglementSwappingB.x_z_cir (Circuit): circuit that corrects state with an x and z gate.
+
+    Attributes:
+        own (QuantumRouter): node that protocol instance is attached to.
+        name (str): name of protocol instance.
+        memory (Memory): memory to swap.
+        remote_protocol_name (str): name of another protocol to communicate with for swapping.
+        remote_node_name (str): name of node hosting the other protocol.
+    """
+
+    x_cir = Circuit(1)
+    x_cir.x(0)
+
+    z_cir = Circuit(1)
+    z_cir.z(0)
+
+    x_z_cir = Circuit(1)
+    x_z_cir.x(0)
+    x_z_cir.z(0)
+
+    def __init__(self, own: "Node", name: str, hold_memo: "Memory"):
+        """Constructor for entanglement swapping B protocol.
+
+        Args:
+            own (Node): node protocol instance is attached to.
+            name (str): name of protocol instance.
+            hold_memo (Memory): memory entangled with a memory on middle node.
+        """
+
+        EntanglementProtocol.__init__(self, own, name)
+
+        self.memories = [hold_memo]
+        self.memory = hold_memo
+        self.remote_protocol_name = None
+        self.remote_node_name = None
+
+    def is_ready(self) -> bool:
+        return self.remote_protocol_name is not None
+
+    def set_others(self, protocol: str, node: str, memories: List[str]) -> None:
+        """Method to set other entanglement protocol instance.
+
+        Args:
+            protocol (str): other protocol name.
+            node (str): other node name.
+            memories (List[str]): the list of memory names used on other node.
+        """
+        self.remote_node_name = node
+        self.remote_protocol_name = protocol
+
+    def received_message(self, src: str, msg: "EntanglementSwappingMessage") -> None:
+        """Method to receive messages from EntanglementSwappingA.
+
+        Args:
+            src (str): name of node sending message.
+            msg (EntanglementSwappingMesssage): message sent.
+
+        Side Effects:
+            Will invoke `update_resource_manager` method.
+        """
+
+        log.logger.debug(
+            self.own.name + " protocol received_message from node {}, fidelity={}".format(src, msg.fidelity))
+        print("######################   src=", src, "remoteNode=", self.remote_node_name, "at ",self.own.name,"#######################################")
+        # assert src == self.remote_node_name
+
+        # if msg.fidelity > 0 and self.own.timeline.now() < msg.expire_time:
+        #     if msg.meas_res == [1, 0]:
+        #         self.own.timeline.quantum_manager.run_circuit(self.z_cir, [self.memory.qstate_key])
+        #     elif msg.meas_res == [0, 1]:
+        #         self.own.timeline.quantum_manager.run_circuit(self.x_cir, [self.memory.qstate_key])
+        #     elif msg.meas_res == [1, 1]:
+        #         self.own.timeline.quantum_manager.run_circuit(self.x_z_cir, [self.memory.qstate_key])
+
+        #     self.memory.fidelity = msg.fidelity
+        #     self.memory.entangled_memory["node_id"] = msg.remote_node
+        #     self.memory.entangled_memory["memo_id"] = msg.remote_memo
+        #     self.memory.update_expire_time(msg.expire_time)
+        #     self.update_resource_manager(self.memory, "ENTANGLED")
+        # else:
+        #     self.update_resource_manager(self.memory, "RAW")
+
+    def start(self) -> None:
+        log.logger.info(f"{self.own.name} end protocol start with partner {self.remote_node_name}")
+
+    def memory_expire(self, memory: "Memory") -> None:
+        """Method to deal with expired memories.
+
+        Args:
+            memory (Memory): memory that expired.
+
+        Side Effects:
+            Will update memory in attached resource manager.
+        """
+
+        self.update_resource_manager(self.memory, "RAW")
+
+    def release(self) -> None:
+        self.update_resource_manager(self.memory, "ENTANGLED")
+
+
 class NodesTracker():
     def __init__( self, _tl, _numRouters, _numGenerations, _light_speed, _endnode_distance ):
         self.tl = _tl
@@ -674,7 +933,7 @@ class NodesTracker():
         self.swpAccDelayDelta = 0
         self.signalingDelay = ( max( self.cnodeNo, _numRouters + 1 - self.cnodeNo )
                                 * _endnode_distance / _light_speed / ( _numRouters + 1 ) ) 
-        self.t_cut = None
+        
     def reset( self ):
         #self.memosToTrack.clear()
         #self.entangledMemories.clear()
@@ -685,7 +944,10 @@ class NodesTracker():
         self.numTrials = 0
         self.process = None
         self.result = None
+        self.linksForNextSession.clear()
+        self.cnode.cnodeData.reset()
         
+
     #def resetNodesUpdatesFlags( self ):    
     #    for j in range( self.numRouters + 2 ):
     #       _eg_updates = self.nodes[2*j].resource_manager.eg_updates
@@ -986,17 +1248,23 @@ class NodesTracker():
             continue
 
 
-    def doAction(s, __action):
+    def doAction(s, __action, n):
         if len(__action) == 0:
-            pass
+            _process2 = Process( s, 'postAction',[])
+            _time_to_wait = 1
+            s.tl.schedule( Event( s.tl.now() + _time_to_wait, _process2 ) )
 
         else:
-            for i in __action:
-                rightNodeName = s.nodes[2*i].right_memo.entangled_memory['node_id']
-                rightNodeNo = rightNodeName[4:]
-                leftNodeName = s.nodes[2*i].left_memo.entangled_memory['node_id']
-                leftNodeNo = leftNodeName[4:]
+            i = __action[n]
+            s.cnode.cnodeData.numSwapsUpdated += 1 
+            rightNodeName = s.nodes[2*i].right_memo.entangled_memory['node_id']
+            leftNodeName = s.nodes[2*i].left_memo.entangled_memory['node_id']
+            print("############# Node", i, 'is entangled with left node:',leftNodeName, "and right node:", rightNodeName  )
+            if rightNodeName is not None and leftNodeName is not None:
+                rightNodeNo = int(rightNodeName[4:])
+                leftNodeNo = int(leftNodeName[4:])
                 midNodeNo = i
+
 
                 s.nodes[2*leftNodeNo].protocols[ 3 ] = None
                 s.nodes[2*rightNodeNo].protocols[ 2 ] = None
@@ -1023,37 +1291,67 @@ class NodesTracker():
                     raise ValueError( 'leftNode=%d, midNode=%d, rightNode=%d, cnodeNo=%d' % (
                         leftNodeNo, midNodeNo, rightNodeNo, s.cnodeNo ) )  
                 
-                if rightNodeName is not None and leftNodeName is not None:
-                    
-                    s.nodes[2*leftNodeNo].protocols[3].start()
-                    s.nodes[2*rightNodeNo].protocols[2].start()
-                    s.nodes[2*midNodeNo].protocols[2].start()           
-
-                else:
-                    s.nodes[2*leftNodeNo].protocols[3].update_resource_manager(s.nodes[2*leftNodeNo].right_memo, 'RAW')
-                    s.nodes[2*rightNodeNo].protocols[2].update_resource_manager(s.nodes[2*rightNodeNo].left_memo, 'RAW')
-                    s.nodes[2*midNodeNo].protocols[2].update_resource_manager(s.nodes[2*midNodeNo].left_memo, 'RAW') 
-                    s.nodes[2*midNodeNo].protocols[2].update_resource_manager(s.nodes[2*midNodeNo].right_memo, 'RAW')
             
-            for i in range(len(s.cnode.cnodeData.current_state[:,0])):
-                for j in range(len(s.cnode.cnodeData.current_state[:,0])):
-                    if s.cnode.cnodeData.current_state[i,j] is not -1:
-                        s.cnode.cnodeData.current_state[i,j] += 1
-                    if s.cnode.cnodeData.current_state[i,j] >= s.t_cut:
-                        s.cnode.cnodeData.current_state[i,j] = -1
-                        s.links.append(Link(()))
+                s.nodes[2*leftNodeNo].protocols[3].start()
+                s.nodes[2*rightNodeNo].protocols[2].start()
+                s.nodes[2*midNodeNo].protocols[2].start()           
+
+            else:
+                if s.cnode.cnodeData.numSwapsUpdated == s.cnode.cnodeData.numSwapsToBeUpdatedAtThisSession:
+                    s.cnode.cnodeData.numSwapsUpdated = 0
+                    _process2 = Process( s, 'postAction',[])
+                    _time_to_wait = 1
+                    s.tl.schedule( Event( s.tl.now() + _time_to_wait,
+                                                            _process2 ) )
+                    
+                else:
+                    _process = Process(s, 'doAction', [s.cnode.cnodeData.current_action, s.cnode.cnodeData.numSwapsUpdated])
+                    _time_to_wait = 1
+                    s.tl.schedule( Event(s.tl.now() + _time_to_wait, _process))
+        
+       
 
 
+    def postAction(s):
+        for i in range(len(s.cnode.cnodeData.current_state[:,0])):
+            for j in range(len(s.cnode.cnodeData.current_state[:,0])):
+                if s.cnode.cnodeData.current_state[i,j] != -1:
+                    s.cnode.cnodeData.current_state[i,j] += 1
+        
+        for i in range(len(s.cnode.cnodeData.current_state[:,0])):
+            for j in range(len(s.cnode.cnodeData.current_state[:,0])):
+                if (i<j):
+                    if s.cnode.cnodeData.current_state[i,j] >= s.cnode.cnodeData.t_cut:
+                        s.cnode.cnodeData.current_state[i,j] = s.cnode.cnodeData.current_state[j,i] = -1
+                        for k in range(1, abs(i-j) + 1):  
+                            s.links.append(Link((i+k-1, i+k)))
 
+        s.cnode.cnodeData.numLinksToBeUpdatedAtThisSession = len( s.links )
+        s.cnode.cnodeData.genLinksUpdated = 0
+        print("Nlinks_for next", len(s.links))
+        print("Finally the current state", s.cnode.cnodeData.current_state)
+        for i in range(len(s.cnode.cnodeData.terminal_states)):
 
-
+            if ((s.cnode.cnodeData.current_state == s.cnode.cnodeData.terminal_states[i]).all()):
+                s.result = True
+                s.resetAllMemories()
+                s.flushTotallyAllPendingEvents()
+                #s.resetUsedMemory()
+                #print( 'dbg: no need swapping any more, ENTANGLED' )
+                print("######################FINISHED#################")
+                return
+            
+        print('DoGeneration recalled')
+        process = Process( s, 'doGenerationPart', [] )
+        _time_to_wait = s.signalingDelay + 1
+        s.tl.schedule( Event( s.tl.now() + _time_to_wait, process ) )
+        
 def runSimulations( _numRouters, _distance, _light_speed, _memory_params, _detector_params, _qchannel_params, _swapping_params, _repetitions ):
     _t0 = time.time()
     tl = Timeline()
     tl.init()
 
     nodesTracker = NodesTracker( tl, _numRouters, _repetitions, _light_speed, _distance )
-    nodesTracker.t_cut = 2
     _fiberPieceLength = _distance / ( 2 * ( _numRouters + 1 ) )
     nodes = [ EntangleGenNode( 'node0', tl, nodesTracker, **_memory_params ) ]
     for i in range( 1, _numRouters + 2 ):
@@ -1062,7 +1360,8 @@ def runSimulations( _numRouters, _distance, _light_speed, _memory_params, _detec
         #print( nodes[-1].name, nodei.name )
 
         for name, param in _detector_params.items():
-            bsmNodei.bsm.update_detectors_params( name, param )
+            bsm_name = bsmNodei.name + '.BSM'
+            bsmNodei.components[bsm_name].update_detectors_params( name, param )
         
         _qchannel_params[ "distance" ] = _fiberPieceLength
         
@@ -1082,12 +1381,18 @@ def runSimulations( _numRouters, _distance, _light_speed, _memory_params, _detec
             cc.set_ends( nodes[i], nodes[j].name )
 
     nodesTracker.setNodesList( nodes )
+    nodesTracker.cnode.cnodeData.t_cut = 3
+    jsonFile =  open('n5_p0.500_ps0.500_tc2_tol1e-05.json', encoding="utf-8-sig") 
+    policy_data = json.load(jsonFile)
+    policy_object = policy(policy_data)
+    nodesTracker.cnode.cnodeData.addPolicy(policy_object)
     nodesTracker.setSwappingParams( _swapping_params )
 
     numSuccessCases = 0
     links = []
     delivery_times = []
     for i in range(_repetitions):
+        print('repetition number: ',i)
         nodesTracker.reset()
         nodesTracker.cnode.cnodeData.genLinksEstablished = 0
         assert len( links ) == 0
@@ -1105,14 +1410,46 @@ def runSimulations( _numRouters, _distance, _light_speed, _memory_params, _detec
         tl.schedule( Event( tl.now() + _time_to_wait, process ) )
         tl.init()
         tl.run()
-        _time_end_virt = tl.now()
-
-        if nodesTracker.result:
-            delivery_times.append(_time_end_virt)
-        
+        _time_end_virt = tl.now()-sum(delivery_times)
+        print('result:', nodesTracker.result)
+        delivery_times.append(_time_end_virt)
         if tl.now() > 1160e12:
+            print('time limit reached')
             break
-    
-    return delivery_times
+    avg_delivery_time = [x/1e9 for x in delivery_times]
+    return  sum(avg_delivery_time)/len(avg_delivery_time)
 
-                                
+
+
+N = 1 
+coherence_time_avg1 = 0.1e-3
+coherence_time_avg = 0.5e-3
+coherence_time_stdev = 0.2 * coherence_time_avg1
+attenuation = 0.0002
+mem_eff = 0.9 #9 #3
+det_eff = 0.8 #3
+swap_probability = 0.5 #5 #9
+swap_degradation = 0.95
+maxNumRepeaters = 1
+max_distance_km = 1
+distance_step_km = 1.0
+light_speed = 2e-4
+_numRepeaters= 3
+
+memory_params = { "fidelity": 0.9, "frequency": 2e6, "efficiency": mem_eff,
+                      "coherence_time": coherence_time_avg,
+                      "coherence_time_stdev": coherence_time_stdev,
+                      "wavelength": 500 }
+
+detector_params = { "efficiency": det_eff, 
+                        #"dark_count": 10, 
+                        "time_resolution": 150, 
+                        "count_rate": 50e7 
+                        }
+qchannel_params = { "attenuation": attenuation, 
+                    "polarization_fidelity": 1.0, 
+                    "distance": 0 }
+swapping_params = { "success_prob": swap_probability,
+                    "degradation": swap_degradation }
+
+print(runSimulations( _numRepeaters, max_distance_km, light_speed, memory_params, detector_params, qchannel_params, swapping_params, N))
